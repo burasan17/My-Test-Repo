@@ -1,68 +1,72 @@
 # My-Test-Repo
 
-はい。ただし、RTRIMの結果が空文字列になった後、ECPGのホスト変数を経由するかどうかで動作が異なります。
+結論：いいえ。ECPGで-r no_indicatorを指定していても、全スペースのホスト変数をINSERT文の中でRTRIMした場合、NULL扱いにはなりません。
 
-PostgreSQL公式マニュアルとECPGのソースコードで確認できました。
+PostgreSQLの公式仕様とECPGのソースコードを確認しました。
 
-1. 動作の違い
+1. 具体的な動作
 
-処理パターン	結果
-SQL内でRTRIM(’ ’)	空文字列’’
-SQL内でRTRIMして直接INSERT	空文字列として登録
-RTRIM結果をECPGのchar[]変数に取得	空文字列（先頭が\0）
-その変数を-r no_indicatorで再度INSERT	NULLとして送信
-
-つまり、-r no_indicatorはPostgreSQLのSQL関数には作用せず、ECPGがホスト変数をSQLの入力パラメータへ変換する際に作用します。
-
-2. 具体的な例
-
-ECPGを以下のオプションでコンパイルした場合です。
-
-ecpg -r no_indicator sample.pgc
-
-次の処理を実行します。
+例えば、次のECPGプログラムです。
 
 EXEC SQL BEGIN DECLARE SECTION;
-    char val[10];
+    char val[6] = "     ";
 EXEC SQL END DECLARE SECTION;
-EXEC SQL SELECT RTRIM('     ')
-    INTO :val;
 EXEC SQL INSERT INTO TABLE_B (COL1)
-    VALUES (:val);
+    VALUES (RTRIM(:val));
 
-実際には次のように処理されます。
+-r no_indicatorを指定している場合、次の順序で処理されます。
 
-* PostgreSQLのRTRIMが5文字のスペースを空文字列に変換。
-* ECPGがホスト変数valに空文字列を取得。
-* INSERT時にECPGのECPGis_noind_null()が実行される。
-* val[0] == '\0'のためNULLと判定される。
-* PostgreSQLにNULLが送信される。
-* COL1がNOT NULLなら制約違反になる。
+順序	処理	値
+①	C言語ホスト変数 val	’ ’
+②	ECPGがNULL判定	NULLではない
+③	PostgreSQLにパラメータを渡す	’ ’
+④	PostgreSQLがRTRIM実行	‘’
+⑤	INSERTされる値	‘’（空文字列）
 
-ソースコードでは、ECPGis_noind_null()が文字列の先頭バイトを調べ、\0ならNULLと判定します。VARCHAR型についても同様の判定が実装されています。
+最終的な結果はNULLではなく、空文字列です。
 
-3. 逆にNULLにならないパターン
+したがって、登録先がVARCHARやTEXTのNOT NULLカラムなら、NOT NULL制約違反にはなりません。
 
-次のようにSQL内で完結する場合です。
+登録先がCHAR(n)なら、空文字列が空白埋めされて格納される点にも注意してください。
 
-INSERT INTO TABLE_B (COL1)
-VALUES (RTRIM('     '));
+2. なぜno_indicatorが作用しないのか
 
-この場合、ECPGのホスト変数を経由しないため、-r no_indicatorの影響を受けません。
+-r no_indicatorのNULL判定は、SQLを実行する前、ECPGがホスト変数を入力パラメータに変換する段階で行われます。
 
-結果は空文字列''であり、NOT NULL制約違反にはなりません。
+ECPGの内部関数ECPGis_noind_null()では、文字配列について次のような判定をしています。
 
-4. 今回の障害との関連
+if (*((const char *) ptr) == '\0')
+    return true;
 
-今回の現象について、次の条件が成立するなら原因として非常に有力です。
+つまり、ホスト変数の先頭バイトが\0かどうかを判定しています。
 
-* ECPGのコンパイルオプションが-r no_indicator
-* RTRIMの結果が全スペースから空文字列になる
-* その結果を一度C言語のホスト変数に取得する
-* インジケータを指定せず、別のSQLでINSERTする
+全スペースの場合、先頭バイトは0x20なので、NULLと判定されません。
 
-この条件では、PostgreSQL上ではNULLではなかった空文字列が、ECPGを経由することでNULLとして再登録されます。
+その後、PostgreSQL側でRTRIMによって空文字列になっても、ECPGによるNULL判定は再実行されません。
 
-これは推測だけではなく、ECPGの公式仕様・実装と整合する動作です。
+これはECPGのソースコードで確認できます。
 
-今回の調査では、RTRIMを実行してからINSERTするまでの間にホスト変数を経由しているかを確認するのが最も重要です。
+3. NULLになる場合との比較
+
+INSERT文	登録される値
+VALUES (:val) ※全スペース	全スペース
+VALUES (RTRIM(:val)) ※全スペース	空文字列
+VALUES (:val) ※先頭が\0	NULL
+VALUES (RTRIM(:val)) ※先頭が\0	NULL
+
+※インジケータ変数なし、-r no_indicator指定、通常の文字列ホスト変数を前提とします。
+
+4. 今回の障害について
+
+ここまでの情報から考えると、ホスト変数が本当に全スペースで、INSERT文内でRTRIM(:val)しているだけなら、-r no_indicatorが原因でNULL制約違反になることはありません。
+
+もしNOT NULL制約違反が発生しているなら、疑うべきは次の2点です。
+
+* INSERT直前のホスト変数が全スペースではなく、先頭バイトが\0になっている。
+* インジケータ変数や別のSQL式によって、NULLが渡されている。
+
+特に今回は、INSERT直前のホスト変数の先頭バイトを16進数で確認するのが有効です。
+
+0x20ならスペース、0x00ならno_indicatorによってNULL判定される可能性があります。
+
+公式資料：PostgreSQL ECPG — ホスト変数とNULLインジケータ⁠￼。
